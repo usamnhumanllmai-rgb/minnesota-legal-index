@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-10-16T09:02:49.943410+00:00",
+  "dataset_records": 102835,
+  "dataset_unique_urls": 10092,
+  "validated_unique_urls": 10110,
+  "invalid_validation_urls": 18,
+  "invalid_urls_present_in_dataset": [],
+  "all_dataset_urls_validated": true,
+  "database_records": 102835,
+  "static_site_records": 102835,
+  "static_site_wex_records": 137
+}

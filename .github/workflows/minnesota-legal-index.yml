@@ -1,0 +1,230 @@
+name: Minnesota Legal Index Monitor
+
+on:
+  schedule:
+    - cron: "15 12 * * *"
+      timezone: "America/Chicago"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: minnesota-legal-index
+  cancel-in-progress: false
+
+jobs:
+  monitor-and-build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      index_changed: ${{ steps.monitor.outputs.changed }}
+      site_available: ${{ steps.monitor.outputs.site_available }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests beautifulsoup4 flask urllib3
+
+      - name: Monitor Revisor index changes
+        id: monitor
+        run: |
+          set +e
+          python scripts/monitor_revisor.py
+          code=$?
+
+          case "$code" in
+            0)
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "site_available=true" >> "$GITHUB_OUTPUT"
+              ;;
+            10)
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "site_available=true" >> "$GITHUB_OUTPUT"
+              ;;
+            20)
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "site_available=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "site_available=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+          exit 0
+
+      - name: Crawl Revisor topic URLs
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/crawl_revisor_topics.py
+
+      - name: Parse topic pages
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/batch_parse_topics.py
+
+      - name: Merge parsed outputs
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/merge_topic_outputs.py
+
+      - name: Validate generated hyperlinks
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/validate_links.py
+
+      - name: Build SQLite search index
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/build_search_index.py
+
+      - name: Extract Cornell Wex contract concept
+        if: steps.monitor.outputs.site_available == 'true'
+        run: |
+          python scripts/extract_wex.py \
+            --url "https://www.law.cornell.edu/wex/contract" \
+            --concept "contract" \
+            --out output/wex/contract.json
+
+      - name: Build static search site
+        if: steps.monitor.outputs.site_available == 'true'
+        run: python scripts/build_static_site.py
+
+      - name: Export SQLite database to CSV
+        if: steps.monitor.outputs.site_available == 'true'
+        run: |
+          mkdir -p output/exports
+
+          sqlite3 -header -csv output/legal_index.db \
+            "SELECT * FROM entries;" \
+            > output/exports/minnesota_legal_index_full.csv
+
+          sqlite3 -header -csv output/legal_index.db \
+            "SELECT * FROM entries WHERE reference_type = 'citation';" \
+            > output/exports/minnesota_legal_citations.csv
+
+          sqlite3 -header -csv output/legal_index.db \
+            "SELECT * FROM entries WHERE reference_type = 'see_topic';" \
+            > output/exports/minnesota_legal_cross_references.csv
+
+      - name: Upload successful pipeline artifacts
+        if: steps.monitor.outputs.site_available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: minnesota-legal-index-output
+          path: |
+            output/minnesota_legal_index.jsonl
+            output/link_validation.csv
+            output/legal_index.db
+            output/exports/
+            output/wex/contract.json
+            output/revisor_release_alert.json
+            output/change_history.jsonl
+          if-no-files-found: warn
+
+      - name: Upload outage diagnostics
+        if: steps.monitor.outputs.site_available == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: minnesota-legal-index-outage
+          path: |
+            output/revisor_release_alert.json
+            output/change_history.jsonl
+            output/failures.jsonl
+          if-no-files-found: warn
+
+      - name: Send Revisor outage email
+        if: steps.monitor.outputs.site_available == 'false'
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Minnesota Revisor site unavailable"
+          to: ${{ secrets.MAIL_TO }}
+          from: "Minnesota Legal Index Bot <${{ secrets.MAIL_USERNAME }}>"
+          body: |
+            The Minnesota Revisor index could not be reached after retries.
+
+            Repository: ${{ github.repository }}
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            No index-change deployment was performed.
+            See the workflow artifact `minnesota-legal-index-outage` for diagnostics.
+
+      - name: Send Minnesota index change email
+        if: steps.monitor.outputs.changed == 'true'
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Minnesota Statutes/Rules index change detected"
+          to: ${{ secrets.MAIL_TO }}
+          from: "Minnesota Legal Index Bot <${{ secrets.MAIL_USERNAME }}>"
+          body: |
+            A change was detected in the Minnesota Revisor index.
+
+            Repository: ${{ github.repository }}
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Changed sources and fingerprints:
+            output/revisor_release_alert.json
+
+            Updated artifacts include:
+            - Minnesota legal index JSONL
+            - Link-validation CSV
+            - SQLite search database
+            - CSV exports
+            - Cornell Wex contract extraction
+            - Static search site
+            - Change-history log
+
+      - name: Commit updated index snapshots
+        if: steps.monitor.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output
+          git diff --cached --quiet || git commit -m "Update Minnesota legal index snapshots"
+          git push
+
+      - name: Open release-change issue
+        if: steps.monitor.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const alert = JSON.parse(fs.readFileSync('output/revisor_release_alert.json', 'utf8'));
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Minnesota index change detected: ${alert.checked_at}`,
+              body: "```json\n" + JSON.stringify(alert, null, 2) + "\n```"
+            });
+
+      - name: Open Revisor outage issue
+        if: steps.monitor.outputs.site_available == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const alert = JSON.parse(fs.readFileSync('output/revisor_release_alert.json', 'utf8'));
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Minnesota Revisor site unavailable: ${alert.checked_at}`,
+              body: "```json\n" + JSON.stringify(alert, null, 2) + "\n```"
+            });

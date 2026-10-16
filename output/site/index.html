@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minnesota Legal Index Search</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 1250px; }
+    h1 { margin-bottom: .25rem; }
+    p.lede { color: #444; margin-top: 0; }
+    form { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+    input[type="search"] { flex: 1 1 350px; padding: .65rem; font-size: 1rem; }
+    select { padding: .55rem; font-size: .95rem; }
+    button { padding: .65rem 1.1rem; font-size: 1rem; cursor: pointer; }
+    .count { margin: .9rem 0 .4rem; color: #555; }
+    table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+    th, td { border: 1px solid #ccc; padding: .5rem; text-align: left; vertical-align: top; }
+    th { background: #f3f4f6; }
+    td.reference { font-family: ui-monospace, monospace; }
+    .muted { color: #666; }
+    h2 { margin-top: 2.5rem; }
+    .empty { padding: 1rem; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Minnesota Legal Index Search</h1>
+  <p class="lede">
+    Search Minnesota Statutes and Minnesota Rules topic-index records, including citations,
+    nested subtopics, and cross-references. Also browse Cornell Wex contract authorities.
+  </p>
+
+  <form id="search-form">
+    <input
+      id="query"
+      type="search"
+      placeholder="Search topic, citation, cross-reference, or text"
+      autocomplete="off"
+    >
+
+    <select id="record-type">
+      <option value="">All record types</option>
+      <option value="citation">Citations</option>
+      <option value="see_topic">Cross-references</option>
+    </select>
+
+    <select id="publication">
+      <option value="">All publications</option>
+      <option value="Minnesota Statutes">Minnesota Statutes</option>
+      <option value="Minnesota Rules">Minnesota Rules</option>
+    </select>
+
+    <button type="submit">Search</button>
+    <button type="button" id="clear">Clear</button>
+  </form>
+
+  <div class="count" id="result-count"></div>
+
+  <table id="results-table">
+    <thead>
+      <tr>
+        <th>Publication</th>
+        <th>Topic</th>
+        <th>Subtopic path</th>
+        <th>Type</th>
+        <th>Reference</th>
+        <th>Link</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+
+  <h2>Cornell Wex: contract</h2>
+  <p class="muted">
+    These are authorities explicitly named or linked on the Wex concept page.
+    They are not automatically asserted to be Minnesota-applicable.
+  </p>
+
+  <table id="wex-table">
+    <thead>
+      <tr>
+        <th>Authority type</th>
+        <th>Authority</th>
+        <th>Resolved link</th>
+        <th>Wex source</th>
+      </tr>
+    </thead>
+    <tbody id="wex-body"></tbody>
+  </table>
+
+<script>
+"use strict";
+
+const state = {
+  records: [],
+  wex: []
+};
+
+const elements = {
+  form: document.getElementById("search-form"),
+  query: document.getElementById("query"),
+  recordType: document.getElementById("record-type"),
+  publication: document.getElementById("publication"),
+  clear: document.getElementById("clear"),
+  resultCount: document.getElementById("result-count"),
+  resultsBody: document.getElementById("results-body"),
+  wexBody: document.getElementById("wex-body")
+};
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function link(url, label = "Open") {
+  if (!url) return '<span class="muted">—</span>';
+  return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+}
+
+function renderResults(rows) {
+  elements.resultsBody.innerHTML = "";
+
+  elements.resultCount.textContent =
+    `${rows.length.toLocaleString()} matching record${rows.length === 1 ? "" : "s"}` +
+    (rows.length > 200 ? " — showing first 200" : "");
+
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    row.innerHTML = '<td colspan="6" class="empty">No matching records.</td>';
+    elements.resultsBody.appendChild(row);
+    return;
+  }
+
+  for (const row of rows.slice(0, 200)) {
+    const tr = document.createElement("tr");
+
+    tr.innerHTML = `
+      <td>${escapeHtml(row.publication)}</td>
+      <td>${escapeHtml(row.topic)}</td>
+      <td>${escapeHtml(row.subtopic_path || "—")}</td>
+      <td>${escapeHtml(row.reference_type)}</td>
+      <td class="reference">${escapeHtml(row.reference)}</td>
+      <td>${link(row.url)}</td>
+    `;
+
+    elements.resultsBody.appendChild(tr);
+  }
+}
+
+function renderWex(rows) {
+  elements.wexBody.innerHTML = "";
+
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    row.innerHTML = '<td colspan="4" class="empty">No Wex records loaded.</td>';
+    elements.wexBody.appendChild(row);
+    return;
+  }
+
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+
+    tr.innerHTML = `
+      <td>${escapeHtml(row.authority_type)}</td>
+      <td>${escapeHtml(row.authority_name)}</td>
+      <td>${link(row.resolved_url)}</td>
+      <td>${link(row.source_hyperlink, "Wex")}</td>
+    `;
+
+    elements.wexBody.appendChild(tr);
+  }
+}
+
+function normalize(value) {
+  return String(value ?? "").toLowerCase();
+}
+
+function search(event) {
+  if (event) event.preventDefault();
+
+  const query = normalize(elements.query.value.trim());
+  const recordType = elements.recordType.value;
+  const publication = elements.publication.value;
+
+  const matches = state.records.filter((row) => {
+    const haystack = normalize([
+      row.publication,
+      row.topic,
+      row.subtopic_path,
+      row.reference,
+      row.cross_reference_topic,
+      row.raw_text
+    ].join(" "));
+
+    const queryMatch = !query || haystack.includes(query);
+    const typeMatch = !recordType || row.reference_type === recordType;
+    const publicationMatch = !publication || row.publication === publication;
+
+    return queryMatch && typeMatch && publicationMatch;
+  });
+
+  renderResults(matches);
+}
+
+function clearFilters() {
+  elements.query.value = "";
+  elements.recordType.value = "";
+  elements.publication.value = "";
+  renderResults(state.records);
+}
+
+async function load() {
+  const response = await fetch("index_data.json");
+  const data = await response.json();
+
+  state.records = data.records || [];
+  state.wex = data.wex || [];
+
+  renderResults(state.records);
+  renderWex(state.wex);
+}
+
+elements.form.addEventListener("submit", search);
+elements.clear.addEventListener("click", clearFilters);
+elements.query.addEventListener("input", search);
+elements.recordType.addEventListener("change", search);
+elements.publication.addEventListener("change", search);
+
+load();
+</script>
+</body>
+</html>
